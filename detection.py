@@ -1,124 +1,87 @@
+import random
+
+import lightning as L
 import torch
-from torch import optim
-from torch.utils.data import Dataset
-import torchvision.io as io
-from torchvision import tv_tensors, utils, models
 import torchvision.transforms.v2 as transforms
+from torch import optim
+from torchmetrics.detection import IntersectionOverUnion, MeanAveragePrecision
 
-import matplotlib.pyplot as plt
-import tqdm
+from datasets import DetectionDataModule
+from models import DetectionTLNetwork
+from utils import show_images_with_boxes
 
-from pathlib import Path
-
-
-DEVICE = "cuda"
-TRAIN_PATH = "./datasets/detection/train/"
-TEST_PATH = "./datasets/detection/val/"
 IMAGE_SIZE = (128, 128)
-BATCH_SIZE = 32
-
-
-def show_image(image, boxes):
-    image = utils.draw_bounding_boxes(image, boxes)
-    plt.imshow(image.permute(1, 2, 0))
-    plt.show()
-
-
-class DetectionDataset(Dataset):
-    
-    def __init__(self, path, transform=None):
-        super().__init__()
-        self.transform = transform
-        self.image_names = []
-        self.labels = {}
-
-        path = Path(path)
-        for i, dir in enumerate(path.iterdir()):
-            if not dir.is_dir():
-                continue
-            self.image_names.extend([x for x in dir.iterdir() if x.match("*.jpg")])
-            self.labels[dir.name] = i
-    
-    def __len__(self):
-        return len(self.image_names)
-    
-    def __getitem__(self, index):
-        if torch.is_tensor(index):
-            index = index.item()
-        
-        image_name = self.image_names[index]
-        image = tv_tensors.Image(io.decode_image(image_name)).to(DEVICE)
-        
-        file_name = image_name.with_suffix(".txt")
-        fnums = []
-        with open(file_name) as f:
-            for line in f.readlines():
-                line = [int(x) for x in line.split(',')]
-                size = line[:2]
-                x1, y1, x2, y2 = line[2:]
-                if x2 - x1 <= 0 or y2 - y1 <= 0:
-                    line[4] += 1
-                    line[5] += 1
-                fnums.append(line[2:])
-        
-        cls = file_name.parent.name
-        labels = [self.labels[cls]] * len(fnums)
-        boxes = tv_tensors.BoundingBoxes(fnums, format="XYXY", canvas_size=size).to(DEVICE)
-        
-        sample = {
-            "image": image,
-            "labels": torch.tensor(labels, dtype=torch.int64).to(DEVICE),
-            "boxes": boxes,
-        }
-        
-        if self.transform:
-            sample["image"], sample["boxes"] = self.transform(sample["image"], sample["boxes"])
-        
-        return sample
-
-
-to_tensor = transforms.Compose([
-    transforms.ToImage(),
-    transforms.ToDtype(
-        {tv_tensors.Image: torch.float32, tv_tensors.BoundingBoxes: torch.float32},
-        scale=True
-    ),
-]).to(DEVICE)
+BATCH_SIZE = 4
 
 train_transforms = transforms.Compose([
-    to_tensor,
-    transforms.Resize(IMAGE_SIZE),
-    # transforms.RandomHorizontalFlip(),
-    # transforms.RandomRotation(degrees=15),
-]).to(DEVICE)
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(degrees=15),
+])
 
-test_transforms = transforms.Compose([
-    to_tensor,
-    transforms.Resize(IMAGE_SIZE),
-]).to(DEVICE)
 
-train_dataset = DetectionDataset(TRAIN_PATH, train_transforms)
-test_dataset = DetectionDataset(TEST_PATH, test_transforms)
-
-model = models.detection.fasterrcnn_resnet50_fpn(weights="DEFAULT").to(DEVICE)
-
-optimizer = optim.SGD(model.parameters(), lr=1e-4, momentum=0.9)
-
-model.train()
-for epoch in tqdm.trange(10):
-    for sample in tqdm.tqdm(train_dataset):
-        image = sample.pop("image").to(DEVICE)
-        losses = model([image], [sample])
+class Detector(L.LightningModule):
+    
+    def __init__(self, lr, momentum):
+        super().__init__()
         
-        optimizer.zero_grad()
-        unified_loss = torch.sum(torch.tensor(list(losses.values()), requires_grad=True)).to(DEVICE)
-        unified_loss.backward()
-        optimizer.step()
-    tqdm.tqdm.write(f"Loss @ {epoch}: {unified_loss.item()}")
+        self.save_hyperparameters()
+        
+        self.model = DetectionTLNetwork()
+        
+        self.val_IoU = IntersectionOverUnion()
+        self.val_mAP = MeanAveragePrecision()
+    
+    def training_step(self, batch, batch_idx):
+        images, labels, boxes = batch
+        labels_and_boxes = [dict(labels=ls, boxes=bs) for ls, bs in zip(labels, boxes)]
+        losses = self.model(images, labels_and_boxes)
+        loss = sum(loss for loss in losses.values())
+        self.log("train_loss", loss.item())
+        return loss
+    
+    def configure_optimizers(self):
+        return optim.SGD(self.parameters(), lr=self.hparams["lr"], momentum=self.hparams["momentum"])
+    
+    def validation_step(self, batch, batch_idx):
+        images, true_labels, true_boxes = batch
+        true_labels_and_boxes = [dict(labels=ls, boxes=bs) for ls, bs in zip(true_labels, true_boxes)]
+        results = self.model(images)
+        self.val_IoU.update(results, true_labels_and_boxes)
+        self.val_mAP.update(results, true_labels_and_boxes)
+    
+    def on_validation_epoch_end(self):
+        IoU = self.val_IoU.compute()["iou"]
+        mAP = self.val_mAP.compute()["map"]
+        self.log("val_iou", IoU)
+        self.log("val_map", mAP)
+        self.val_IoU.reset()
+        self.val_mAP.reset()
 
-model.eval()
-sample = test_dataset[130]
-image = sample["image"]
-result = model([image])[0]
-idx = result["scores"].argmax(dim=0)
-show_image(image.cpu(), result["boxes"][idx].unsqueeze(dim=0))
+
+detector = Detector(0.0001, 0.9)
+trainer = L.Trainer(max_epochs=1, log_every_n_steps=1)
+datamodule = DetectionDataModule(IMAGE_SIZE, BATCH_SIZE)
+trainer.fit(detector, datamodule=datamodule)
+
+# detector = Detector.load_from_checkpoint("./checkpoints/epoch=399-step=15200.ckpt").to("cpu")
+
+detector.eval()
+datamodule.setup("test")
+test_dataset = datamodule.test_dataset
+
+idxs = random.sample(range(len(test_dataset)), k=16)
+samples = [test_dataset[i] for i in idxs]
+images = torch.stack([sample["image"] for sample in samples], dim=0)
+results = detector.model(images)
+
+true_boxes = []
+pred_boxes = []
+scores = []
+for sample, result in zip(samples, results):
+    k = min(len(result["boxes"]), len(sample["boxes"]))
+    idx = torch.topk(result["scores"], k=k).indices
+    pred_boxes.append(result["boxes"][idx])
+    scores.append(result["scores"][idx])
+    true_boxes.append(sample["boxes"])
+
+show_images_with_boxes(images, pred_boxes, true_boxes, scores)
