@@ -72,3 +72,29 @@ class DetectionTLNetwork(nn.Module):
             return self.model(images, labels_and_boxes)
         else:
             return self.model(images)
+
+
+class SiameseNetwork(nn.Module):
+    
+    def __init__(self):
+        super().__init__()
+        
+        self.layers = nn.Sequential(
+            ConvBlock(1, 8, 16),
+            nn.LocalResponseNorm(3),
+            ConvBlock(16, 32, 64),
+            ConvBlock(64, 128, 256),
+            nn.AvgPool2d(32),
+            nn.Flatten(),
+            nn.Linear(256, 512),
+            nn.Dropout(),
+            nn.Linear(512, 128)
+        )
+
+    def f_pass(self, X):
+        return self.layers(X)
+    
+    def forward(self, X1, X2):
+        out1 = self.f_pass(X1)
+        out2 = self.f_pass(X2)
+        return out1, out2

@@ -11,11 +11,14 @@ from torchvision.transforms import v2 as transforms
 
 class ClassificationDataModule(L.LightningDataModule):
     
-    def __init__(self, image_size, batch_size, train_transform=None, test_transform=None):
+    def __init__(
+        self, image_size, batch_size, train_transform=None, test_transform=None, train_shuffle=True
+    ):
         super().__init__()
         
         self.image_size = image_size
         self.batch_size = batch_size
+        self.train_shuffle = train_shuffle
         
         to_tensor = transforms.Compose([
             transforms.ToImage(),
@@ -51,7 +54,7 @@ class ClassificationDataModule(L.LightningDataModule):
             self.test_dataset = ImageFolder(test_path, transform=self.test_transform)
     
     def train_dataloader(self):
-        return self.get_dataloader(self.train_dataset, shuffle=True)
+        return self.get_dataloader(self.train_dataset, shuffle=self.train_shuffle)
     
     def val_dataloader(self):
         return self.get_dataloader(self.val_dataset)
@@ -125,11 +128,14 @@ class DetectionDataset(Dataset):
 
 class DetectionDataModule(L.LightningDataModule):
     
-    def __init__(self, image_size, batch_size, train_transform=None, test_transform=None):
+    def __init__(
+        self, image_size, batch_size, train_transform=None, test_transform=None, train_shuffle=True
+    ):
         super().__init__()
         
         self.image_size = image_size
         self.batch_size = batch_size
+        self.train_shuffle = train_shuffle
         
         to_tensor = transforms.Compose([
             transforms.ToImage(),
@@ -168,10 +174,74 @@ class DetectionDataModule(L.LightningDataModule):
             self.test_dataset = DetectionDataset(test_path, self.test_transform)
     
     def train_dataloader(self):
-        return self.get_dataloader(self.train_dataset, shuffle=False)
+        return self.get_dataloader(self.train_dataset, shuffle=self.train_shuffle)
     
     def val_dataloader(self):
         return self.get_dataloader(self.val_dataset)
     
     def test_dataloader(self):
         return self.get_dataloader(self.test_dataset)
+
+
+class FewShotLearningDataset(Dataset):
+    
+    def __init__(self, path, transform=None):
+        super().__init__()
+        
+        self.path = path
+        self.transform = transform
+        
+        self.image_names = []
+        self.labels = []
+        
+        path = Path(path)
+        for i, dir in enumerate(path.iterdir()):
+            if not dir.is_dir():
+                continue
+            image_files = [x for x in dir.iterdir() if x.match("*.jpg")]
+            self.image_names.extend(image_files)
+            self.labels.extend([int(dir.name)] * len(image_files))
+    
+    def __len__(self):
+        return len(self.image_names) ** 2
+    
+    def __getitem__(self, index):
+        if torch.is_tensor(index):
+            index = index.item()
+        
+        n = len(self.image_names)
+        idx1 = index // n
+        idx2 = index % n
+        
+        # ensure the two images are different
+        if idx2 == idx1:
+            idx2 = idx2 + 1 if idx2 == 0 else idx2 - 1
+        
+        image1 = tv_tensors.Image(io.decode_image(self.image_names[idx1]))
+        class1 = self.labels[idx1]
+        
+        image2 = tv_tensors.Image(io.decode_image(self.image_names[idx2]))
+        class2 = self.labels[idx2]
+        
+        label = 0 if class1 == class2 else 1
+        
+        if self.transform:
+            image1 = self.transform(image1)
+            image2 = self.transform(image2)
+        
+        return image1, image2, label, class1, class2
+
+
+class FewShotLearningDataModule(ClassificationDataModule):
+    
+    def setup(self, stage):
+        root_path = "./datasets/few-shot-learning/"
+        
+        if stage == "fit":
+            train_path = root_path + "train/whale/"
+            dataset = FewShotLearningDataset(train_path, self.train_transform)
+            self.train_dataset, self.val_dataset = random_split(dataset, (0.85, 0.15))
+        
+        if stage == "test":
+            test_path = root_path + "val/whale/"
+            self.test_dataset = FewShotLearningDataset(test_path, self.test_transform)
